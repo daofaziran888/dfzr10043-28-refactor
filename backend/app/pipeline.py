@@ -394,38 +394,188 @@ def detect_element_drift(locator_id: int, flow_run_id: int) -> dict[str, Any]:
 
 # ── 链路6: 表单字段校验 → 步骤轨迹异常 → 重试恢复 ─
 
-def validate_form_field(field_id: int, trace_id: int) -> dict[str, Any]:
-    """校验表单字段取值，校验失败时写入步骤轨迹异常并触发重试策略恢复。"""
+def _field_recovery_policy_id(rule_id: int) -> int | None:
+    """按异常规则找关联的重试策略。"""
+    retry_svc = service_for("retry_policy")
+    rule = _find_entry("exception_rule", rule_id)
+    policies = retry_svc.list_entries(size=1000)[0]
+    for policy in policies:
+        if policy.get("关联规则") == rule.get("规则编号"):
+            return policy["id"]
+    return None
+
+
+def _active_field_rule() -> dict[str, Any] | None:
+    rule_svc = service_for("exception_rule")
+    for rule in rule_svc.list_entries(size=1000)[0]:
+        if rule.get("status") == "已生效" and rule.get("适用范围", "").find("字段") >= 0:
+            return rule
+    return None
+
+
+def _attach_trace_evidence(
+    trace_id: int,
+    *,
+    execution_id: str,
+    determination: dict[str, Any],
+    reason: str,
+) -> None:
+    """把来源判定和执行标识写到步骤轨迹，供重试策略与追溯消费。"""
+    trace_svc = service_for("step_trace")
+    trace = _find_entry("step_trace", trace_id)
+    trace["来源判定"] = {
+        "字段编号": determination.get("字段编号", ""),
+        "取值来源": determination.get("source_raw", ""),
+        "去空格来源": determination.get("source_stripped", ""),
+        "字段名称": determination.get("字段名称", ""),
+        "来源非空": determination.get("has_source"),
+        "原文比较相同": determination.get("source_is_name_raw"),
+        "去空格比较相同": determination.get("source_is_name_stripped"),
+    }
+    trace["执行标识"] = execution_id
+    trace["失败依据"] = reason
+
+
+def _submit_field_recovery(
+    field: dict[str, Any],
+    trace_id: int,
+    *,
+    execution_id: str,
+    determination: dict[str, Any],
+) -> dict[str, Any]:
+    """用该执行的失败凭据接续重试处置，返回原有形状的结果。"""
+    field_svc = service_for("form_field")
+    rule = _active_field_rule()
+    if rule is None:
+        return {"status": "validated", "field_id": field.get("id"), "is_valid": False}
+
+    policy_id = _field_recovery_policy_id(rule["id"])
+    if policy_id is None:
+        return {"status": "no_policy", "reason": "无关联重试策略，异常未处理"}
+
+    evidence = field_svc.record_source_failure(
+        field["id"], execution_id=execution_id, trace_id=trace_id,
+        entry="采集", determination=determination,
+    )
+    retry_svc = service_for("retry_policy")
+    signature = (
+        f"表单字段校验失败:{field.get('字段编号')}:"
+        f"trace_{trace_id}:exec_{execution_id}"
+    )
+    result = retry_svc.continue_failure_recovery(
+        evidence, policy_id, signature=signature, execution_id=execution_id)
+    field_svc.complete_source_failure(execution_id, field["id"], result)
+
+    # 保留原有返回键：retrying 用 attempt，abandoned 用 attempts。
+    shaped = dict(result)
+    if shaped.get("status") == "retrying":
+        shaped.setdefault("attempt", evidence.get("attempt"))
+    if shaped.get("status") == "abandoned":
+        shaped.setdefault("attempts", int(result.get("retry_total", 0)) + 1)
+    shaped.setdefault("max_attempts", result.get("max_attempts"))
+    return shaped
+
+
+def validate_form_field(
+    field_id: int,
+    trace_id: int,
+    *,
+    execution_id: str | None = None,
+    defer_recovery: bool = False,
+) -> dict[str, Any]:
+    """校验表单字段取值，校验失败时写入步骤轨迹异常并触发重试策略恢复。
+
+    ``execution_id`` 区分同字段的并发执行，失败凭据按执行隔离；
+    ``defer_recovery=True`` 时只记失败轨迹与凭据，停在递交恢复请求之前，
+    之后可用 ``resume_form_field_recovery`` 用原输入续做。
+    """
     field_svc = service_for("form_field")
     field = _find_entry("form_field", field_id)
 
-    # 检查取值来源是否可用
-    value_source = field.get("取值来源", "")
-    validation_rule = field.get("校验规则", "")
+    trace_svc = service_for("step_trace")
+    trace = _find_entry("step_trace", trace_id)
+    resolved_execution = execution_id or str(trace.get("关联执行") or f"trace_{trace_id}")
 
-    # 模拟校验逻辑
-    is_valid = len(value_source) > 0 and value_source != field.get("字段名称", "")
+    # 来源读取只有 resolve_source 一处，采集口径：原文比较。
+    determination = field_svc.resolve_source(field)
+    is_valid = field_svc.collection_source_valid(determination)
+
     if not is_valid:
         field_svc.run_action(field_id, "重新校验")
         field_svc.run_action(field_id, "重新校验")  # 第二次标记为失败
 
     if field.get("status") == "校验失败":
-        # 写步骤轨迹异常
-        trace_svc = service_for("step_trace")
-        trace = _find_entry("step_trace", trace_id)
+        # 写步骤轨迹异常，并把来源判定与执行标识带进轨迹
         trace_svc.run_action(trace_id, "标记异常")
-
-        # 触发重试恢复
-        rule_svc = service_for("exception_rule")
-        all_rules = rule_svc.list_entries(size=1000)[0]
-        for rule in all_rules:
-            if rule.get("status") == "已生效" and rule.get("适用范围", "").find("字段") >= 0:
-                return match_exception_and_retry(
-                    f"表单字段校验失败:{field.get('字段编号')}:trace_{trace_id}",
-                    rule["id"]
-                )
+        _attach_trace_evidence(
+            trace_id, execution_id=resolved_execution,
+            determination=determination, reason="取值来源无效，校验失败",
+        )
+        field_svc.record_source_failure(
+            field_id, execution_id=resolved_execution, trace_id=trace_id,
+            entry="采集", determination=determination,
+        )
+        if defer_recovery:
+            # 停在递交恢复请求之前；凭据已落，A 可稍后用原输入续做。
+            return {
+                "status": "pending_recovery",
+                "field_id": field_id,
+                "execution_id": resolved_execution,
+                "trace_id": trace_id,
+                "is_valid": is_valid,
+            }
+        return _submit_field_recovery(
+            field, trace_id, execution_id=resolved_execution,
+            determination=determination)
 
     return {"status": "validated", "field_id": field_id, "is_valid": is_valid}
+
+
+def resume_form_field_recovery(
+    field_id: int,
+    trace_id: int | None = None,
+    *,
+    execution_id: str | None = None,
+    policy_id: int | None = None,
+) -> dict[str, Any]:
+    """用原失败凭据续做未完成的恢复；重复续做不会重复消耗同一次重试。"""
+    field_svc = service_for("form_field")
+    field = _find_entry("form_field", field_id)
+
+    if execution_id is None:
+        record = next(iter(field_svc.source_failure_evidence(field_id=field_id)), None)
+        if record is None:
+            return {"status": "no_evidence", "reason": "没有可续做的失败凭据"}
+        execution_id = record["execution_id"]
+
+    record = field_svc.get_source_failure(execution_id, field_id)
+    if record is None:
+        return {"status": "no_evidence", "reason": "该执行没有该字段的失败凭据"}
+
+    trace_id = trace_id if trace_id is not None else (
+        record["trace_ids"][0] if record["trace_ids"] else None)
+    determination = record.get("basis") or field_svc.resolve_source(field)
+
+    if policy_id is None:
+        rule = _active_field_rule()
+        policy_id = _field_recovery_policy_id(rule["id"]) if rule else None
+    if policy_id is None:
+        return {"status": "no_policy", "reason": "无关联重试策略，异常未处理"}
+
+    retry_svc = service_for("retry_policy")
+    signature = (
+        f"表单字段校验失败:{field.get('字段编号')}:"
+        f"trace_{trace_id}:exec_{execution_id}"
+    )
+    result = retry_svc.continue_failure_recovery(
+        record, policy_id, signature=signature, execution_id=execution_id)
+    field_svc.complete_source_failure(execution_id, field_id, result)
+    shaped = dict(result)
+    if shaped.get("status") == "abandoned":
+        shaped.setdefault("attempts", int(result.get("retry_total", 0)) + 1)
+    shaped.setdefault("max_attempts", result.get("max_attempts"))
+    return shaped
+
 
 
 # ── 链路7: 版本灰度发布 → 流程执行回滚 → 版本绑定切换 ─

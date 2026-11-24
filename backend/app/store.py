@@ -14,6 +14,13 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 辅助命名空间：存放不属于任何业务模块清单的运行时凭据（如失败恢复凭据），
+        # 与业务表一起初始化、一起重置，保证测试隔离。
+        self._aux: dict[str, dict[str, Any]] = {}
+
+    def aux(self, namespace: str) -> dict[str, Any]:
+        """按命名空间取辅助字典；reset() 时一并清空。"""
+        return self._aux.setdefault(namespace, {})
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -50,6 +57,7 @@ class Store:
         self._tables = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        self._aux = {}
 
 
 store = Store()
